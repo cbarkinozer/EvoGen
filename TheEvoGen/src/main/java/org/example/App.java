@@ -12,13 +12,17 @@ import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import io.github.cdimascio.dotenv.Dotenv;
+import java.util.ArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class App {
 
+    private static final String PROJECT_TO_TEST_PATH = "C:\\Repos\\OnlineBankingRestAPI";
     // Configuration
     private static final String EVOSUITE_JAR = "evosuite-master.jar";
     private static final String SOURCE_DIR = "src/main/java";
@@ -31,57 +35,160 @@ public class App {
     private static final String GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
     private static final String GROQ_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"; // A very capable model
 
-    // JSON Helper
-    private static final Gson GSON = new GsonBuilder().create();
+    /** The path to the EvoSuite runtime JAR, relative to our project's root. */
+    private static final String EVOSUITE_RUNTIME_JAR = "evosuite-standalone-runtime-1.2.0.jar";
 
-    // Data Classes for JSON
+    /** How many classes to process in parallel. Set to the number of cores on your machine for best results. */
+    private static final int PARALLEL_THREADS = 4;
+
+    // --- Global Helpers ---
+    private static final Gson GSON = new GsonBuilder().create();
+    private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
     static class Message { String role; String content; Message(String r, String c) { role=r; content=c; } }
     static class Choice { Message message; }
     static class ChatResponse { List<Choice> choices; }
     static class ChatRequest { List<Message> messages; String model; ChatRequest(List<Message> m, String mo) { messages=m; model=mo; } }
 
-    public static void main(String[] args) throws IOException, InterruptedException {
+    public static void main(String[] args) throws InterruptedException {
         if (GROQ_API_KEY == null || GROQ_API_KEY.isBlank()) {
-            System.out.println("❌ FATAL ERROR: GROQ_API_KEY environment variable not set. Please set it and try again.");
+            System.err.println("❌ FATAL ERROR: GROQ_API_KEY environment variable not set.");
             return;
         }
 
-        System.out.println("Starting EvoSuite Refactoring Process (Java version)...");
-        String rawTestPath = runEvoSuite();
+        System.out.println("🚀 Starting Test Generation Bot for project: " + PROJECT_TO_TEST_PATH);
 
-        if (rawTestPath != null && !rawTestPath.isBlank()) {
-            System.out.println("\n✅ EvoSuite generation successful.");
-            refactorWithLLM(rawTestPath);
-        } else {
-            System.out.println("\n❌ EvoSuite generation failed. Aborting.");
+        List<String> classesToTest = discoverClasses(PROJECT_TO_TEST_PATH);
+        if (classesToTest.isEmpty()) {
+            System.err.println("❌ No classes found to test. Did you build the target project with 'mvn install'?");
+            return;
+        }
+
+        System.out.println("✅ Found " + classesToTest.size() + " classes to test. Starting parallel processing...");
+
+        ExecutorService executor = Executors.newFixedThreadPool(PARALLEL_THREADS);
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failureCount = new AtomicInteger(0);
+
+        for (String className : classesToTest) {
+            executor.submit(() -> {
+                try {
+                    boolean success = processClass(className);
+                    if (success) {
+                        successCount.incrementAndGet();
+                    } else {
+                        failureCount.incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    System.err.println("🔥 UNCAUGHT EXCEPTION for class " + className + ": " + e.getMessage());
+                    e.printStackTrace();
+                    failureCount.incrementAndGet();
+                }
+            });
+        }
+
+        executor.shutdown();
+        executor.awaitTermination(1, TimeUnit.HOURS); // Wait up to an hour for all tasks to finish
+
+        System.out.println("\n\n=======================================================");
+        System.out.println("🎉 All tasks completed!");
+        System.out.println("   >>> Successful refactorings: " + successCount.get());
+        System.out.println("   >>> Failures: " + failureCount.get());
+        System.out.println("=======================================================");
+    }
+
+    /**
+     * Scans the target project's build directory to find all .class files.
+     * @param projectPath Path to the root of the target Maven project.
+     * @return A list of fully qualified class names.
+     */
+    private static List<String> discoverClasses(String projectPath) {
+        List<String> classNames = new ArrayList<>();
+        Path classesDir = Paths.get(projectPath, "target", "classes");
+        if (!Files.exists(classesDir)) {
+            return classNames; // Return empty list
+        }
+
+        try {
+            Files.walk(classesDir)
+                    .filter(path -> path.toString().endsWith(".class"))
+                    .forEach(path -> {
+                        String relativePath = classesDir.relativize(path).toString();
+                        String className = relativePath.replace(File.separatorChar, '.')
+                                .replaceAll("\\.class$", "");
+                        classNames.add(className);
+                    });
+        } catch (IOException e) {
+            System.err.println("🚨 Error discovering classes: " + e.getMessage());
+        }
+        return classNames;
+    }
+
+    /**
+     * The main processing pipeline for a single class.
+     * @param className The fully qualified name of the class to process.
+     * @return true if the entire process succeeded, false otherwise.
+     */
+    private static boolean processClass(String className) {
+        System.out.println("▶️  Processing class: " + className);
+        try {
+            // Step 1: Run EvoSuite
+            String rawTestPath = runEvoSuite(className);
+            if (rawTestPath == null) {
+                System.out.println("   - ❌ EvoSuite failed to generate tests for " + className);
+                return false;
+            }
+
+            // Step 2: Refactor with LLM
+            String refactoredCode = refactorWithLLM(rawTestPath, className);
+            if (refactoredCode == null) {
+                System.out.println("   - ❌ LLM failed to refactor tests for " + className);
+                return false;
+            }
+
+            // Step 3: Validate the refactored code
+            boolean validationSuccess = validateAndSave(refactoredCode, rawTestPath, className);
+            if (validationSuccess) {
+                System.out.println("   - ✅ Successfully generated and refactored tests for " + className);
+            } else {
+                System.out.println("   - ❌ Validation failed for refactored tests of " + className);
+            }
+            return validationSuccess;
+
+        } catch (Exception e) {
+            System.err.println("   - 🔥 UNCAUGHT EXCEPTION for class " + className + ": " + e.getMessage());
+            return false;
         }
     }
 
-    private static String runEvoSuite() throws IOException, InterruptedException {
-        System.out.println("--- Step 1: Running EvoSuite to generate raw test ---");
-        List<String> command = List.of("java", "-jar", EVOSUITE_JAR, "-class", CLASS_TO_TEST,
-                "-projectCP", PROJECT_CLASSPATH, "-Dtest_dir=" + TEST_OUTPUT_DIR);
+    // --- Core Methods (now parameterized) ---
 
-        ProcessBuilder pb = new ProcessBuilder(command).inheritIO();
+    private static String runEvoSuite(String className) throws IOException, InterruptedException {
+        String projectCP = Paths.get(PROJECT_TO_TEST_PATH, "target", "classes").toString();
+        String testOutputDir = Paths.get(PROJECT_TO_TEST_PATH, "evosuite-tests").toString();
+
+        List<String> command = List.of("java", "-jar", EVOSUITE_JAR, "-class", className,
+                "-projectCP", projectCP, "-Dtest_dir=" + testOutputDir);
+
+        ProcessBuilder pb = new ProcessBuilder(command).inheritIO(); // We can silence this later if it's too noisy
         Process process = pb.start();
         process.waitFor(5, TimeUnit.MINUTES);
 
-        String expectedFilePath = TEST_OUTPUT_DIR + File.separator + CLASS_TO_TEST.replace('.', File.separatorChar) + "_ESTest.java";
+        String expectedFilePath = testOutputDir + File.separator + className.replace('.', File.separatorChar) + "_ESTest.java";
         if (process.exitValue() == 0 && Files.exists(Paths.get(expectedFilePath))) {
             return expectedFilePath;
         }
         return null;
     }
 
-    private static void refactorWithLLM(String rawTestFilePath) throws IOException, InterruptedException {
-        // ... This method is fine, no changes needed from your last version. We'll put it here for completeness.
-        System.out.println("\n--- Step 2: Refactoring generated code with Groq LLM ---");
+    private static String refactorWithLLM(String rawTestFilePath, String className) throws IOException, InterruptedException {
+        String sourceFilePath = Paths.get(PROJECT_TO_TEST_PATH, "src", "main", "java", className.replace('.', File.separatorChar) + ".java").toString();
+        if (!Files.exists(Paths.get(sourceFilePath))) {
+            System.out.println("   - ⚠️ Source file not found for " + className + ", refactoring without context.");
+            return null; // Or refactor without source code context
+        }
 
         String rawCode = Files.readString(Paths.get(rawTestFilePath));
-        String sourceFilePath = SOURCE_DIR + File.separator + CLASS_TO_TEST.replace('.', File.separatorChar) + ".java";
         String sourceCode = Files.readString(Paths.get(sourceFilePath));
-
-        System.out.println("Successfully read raw test file and source context file.");
 
         String prompt = "You are an expert senior Java developer assigned to refactor a JUnit test file. The original test was generated by EvoSuite and is difficult to read.\n\n"
                 + "You will be given two pieces of code:\n"
@@ -103,97 +210,76 @@ public class App {
                 + "**EvoSuite-Generated Test to Refactor:**\n"
                 + "```java\n" + rawCode + "\n```";
 
-
         ChatRequest requestPayload = new ChatRequest(List.of(new Message("user", prompt)), GROQ_MODEL);
-        String jsonBody = GSON.toJson(requestPayload);
-
-        HttpClient client = HttpClient.newHttpClient();
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(GROQ_API_URL))
+        HttpRequest request = HttpRequest.newBuilder().uri(URI.create(GROQ_API_URL))
                 .header("Content-Type", "application/json")
                 .header("Authorization", "Bearer " + GROQ_API_KEY)
-                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
-                .build();
+                .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(requestPayload))).build();
 
-        System.out.println("Sending request to Groq API for context-aware refactoring...");
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() == 200) {
             ChatResponse chatResponse = GSON.fromJson(response.body(), ChatResponse.class);
             String llmMessageContent = chatResponse.choices.get(0).message.content;
-
-            String refactoredCode = null;
             String lowerCaseContent = llmMessageContent.toLowerCase();
             int startBlock = lowerCaseContent.indexOf("```java");
             int endBlock = lowerCaseContent.lastIndexOf("```");
-
             if (startBlock != -1 && endBlock > startBlock) {
-                refactoredCode = llmMessageContent.substring(startBlock + 7, endBlock).trim();
-            } else {
-                refactoredCode = llmMessageContent.trim();
+                return llmMessageContent.substring(startBlock + 7, endBlock).trim();
             }
-
-            if (refactoredCode != null && !refactoredCode.isBlank()) {
-                validateAndSave(refactoredCode, rawTestFilePath);
-            } else {
-                System.out.println("❌ Error: LLM returned an empty or invalid response.");
-            }
-        } else {
-            System.out.println("❌ API Error: " + response.statusCode() + " | " + response.body());
+            return llmMessageContent.trim();
         }
+        return null;
     }
 
-    private static void validateAndSave(String refactoredCode, String originalFilePath) throws IOException, InterruptedException {
-        System.out.println("\n--- Step 3: Validating refactored code by compiling ---");
+    private static boolean validateAndSave(String refactoredCode, String originalFilePath, String className) throws IOException, InterruptedException {
         Path originalFile = Paths.get(originalFilePath);
-        Path tempDir = Files.createTempDirectory("refactor-validation");
+        Path tempDir = Files.createTempDirectory("validation-" + className);
         Path tempFile = tempDir.resolve(originalFile.getFileName());
         Files.writeString(tempFile, refactoredCode);
 
         Path scaffoldingFile = originalFile.getParent().resolve(originalFile.getFileName().toString().replace(".java", "_scaffolding.java"));
         Path tempScaffoldingFile = null;
         if (Files.exists(scaffoldingFile)) {
-            System.out.println("Found scaffolding file: " + scaffoldingFile.getFileName());
             tempScaffoldingFile = tempDir.resolve(scaffoldingFile.getFileName());
             Files.copy(scaffoldingFile, tempScaffoldingFile);
         }
 
-        // --- THE FINAL, CORRECT CLASSPATH STRATEGY ---
-        // Get the classpath that this very program is running with.
-        // It already contains all our dependencies from Maven, including JUnit.
+        // --- The working classpath strategy ---
         String currentClasspath = System.getProperty("java.class.path");
+        String evosuiteRuntimeJarPath = new File(EVOSUITE_RUNTIME_JAR).getAbsolutePath();
+        // **NEW**: We also need the target project's own classes on the classpath!
+        String targetProjectClassesPath = Paths.get(PROJECT_TO_TEST_PATH, "target", "classes").toAbsolutePath().toString();
+        String fullClasspath = String.join(File.pathSeparator, currentClasspath, evosuiteRuntimeJarPath, targetProjectClassesPath);
 
-        // We need to add the EvoSuite runtime JAR manually since it's not a Maven dependency.
-        String evosuiteRuntimeJarPath = new File("evosuite-standalone-runtime-1.2.0.jar").getAbsolutePath();
-        String fullClasspath = currentClasspath + File.pathSeparator + evosuiteRuntimeJarPath;
-
-        System.out.println("Using FINAL classpath for validation: " + fullClasspath);
-        // --- END OF STRATEGY ---
-
-        List<String> compileCommand;
-        if (tempScaffoldingFile != null) {
-            compileCommand = List.of("javac", "-cp", fullClasspath, tempFile.toString(), tempScaffoldingFile.toString());
-        } else {
-            compileCommand = List.of("javac", "-cp", fullClasspath, tempFile.toString());
+        List<String> filesToCompile = new ArrayList<>();
+        filesToCompile.add(tempFile.toString());
+        if(tempScaffoldingFile != null) {
+            filesToCompile.add(tempScaffoldingFile.toString());
         }
 
-        ProcessBuilder pb = new ProcessBuilder(compileCommand).redirectErrorStream(true);
+        List<String> compileCommand = new ArrayList<>();
+        compileCommand.add("javac");
+        compileCommand.add("-cp");
+        compileCommand.add(fullClasspath);
+        compileCommand.addAll(filesToCompile);
+
+        ProcessBuilder pb = new ProcessBuilder(compileCommand);
         Process process = pb.start();
-        String compilerOutput = new String(process.getInputStream().readAllBytes());
-        process.waitFor(30, TimeUnit.SECONDS);
+        process.waitFor(1, TimeUnit.MINUTES);
 
         if (process.exitValue() == 0) {
-            System.out.println("✅✅✅ VICTORY! Validation successful! The refactored code compiles correctly. ✅✅✅");
-            Files.writeString(originalFile, refactoredCode);
-            System.out.println("Saved readable and validated test to: " + originalFilePath);
+            Files.writeString(originalFile, refactoredCode); // Overwrite the original test with the good one
+            tempDir.toFile().deleteOnExit(); // Clean up
+            return true;
         } else {
-            System.out.println("❌ Validation FAILED. The LLM-generated code has compilation errors.");
-            System.out.println("Compiler Output:\n" + compilerOutput);
-            Path failedFile = originalFile.getParent().resolve(originalFile.getFileName().toString().replace(".java", "_refactor_failed.java"));
-            Files.writeString(failedFile, refactoredCode);
-            System.out.println("The faulty refactored code has been saved to: " + failedFile);
+            // Save the failed code for debugging
+            String failedCodeOutput = new String(process.getErrorStream().readAllBytes());
+            if (failedCodeOutput.isBlank()) {
+                failedCodeOutput = new String(process.getInputStream().readAllBytes());
+            }
+            System.err.println("   - ❌ Validation failed for " + className + ". Compiler output:\n" + failedCodeOutput);
+            return false;
         }
-
-        Files.walk(tempDir).sorted(java.util.Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
     }
 }
