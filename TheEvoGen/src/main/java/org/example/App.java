@@ -146,7 +146,23 @@ public class App {
     private static void validateAndSave(String refactoredCode, String originalFilePath) throws IOException, InterruptedException {
         System.out.println("\n--- Step 3: Validating refactored code by compiling ---");
         Path originalFile = Paths.get(originalFilePath);
+
+        // --- NEW LOGIC TO PRESERVE THE ORIGINAL EVO SUITE FILE ---
+        // 1. Define the new name for the original file.
+        Path preservedOriginalFile = originalFile.getParent().resolve(originalFile.getFileName().toString().replace(".java", ".original.java"));
+
+        // 2. Rename the raw EvoSuite test file (e.g., move Calculator_ESTest.java to Calculator_ESTest.original.java).
+        try {
+            Files.move(originalFile, preservedOriginalFile, StandardCopyOption.REPLACE_EXISTING);
+            System.out.println("Preserved original EvoSuite test as: " + preservedOriginalFile.getFileName());
+        } catch (IOException e) {
+            System.err.println("❌ Could not rename original EvoSuite file: " + e.getMessage());
+            // We can still continue, but the original will be lost if the process succeeds.
+        }
+        // --- END OF NEW LOGIC ---
+
         Path tempDir = Files.createTempDirectory("refactor-validation");
+        // We will compile the temporary file with the original name.
         Path tempFile = tempDir.resolve(originalFile.getFileName());
         Files.writeString(tempFile, refactoredCode);
 
@@ -158,17 +174,11 @@ public class App {
             Files.copy(scaffoldingFile, tempScaffoldingFile);
         }
 
-        // --- THE FINAL, CORRECT CLASSPATH STRATEGY ---
-        // Get the classpath that this very program is running with.
-        // It already contains all our dependencies from Maven, including JUnit.
         String currentClasspath = System.getProperty("java.class.path");
-
-        // We need to add the EvoSuite runtime JAR manually since it's not a Maven dependency.
         String evosuiteRuntimeJarPath = new File("evosuite-standalone-runtime-1.2.0.jar").getAbsolutePath();
         String fullClasspath = currentClasspath + File.pathSeparator + evosuiteRuntimeJarPath;
 
         System.out.println("Using FINAL classpath for validation: " + fullClasspath);
-        // --- END OF STRATEGY ---
 
         List<String> compileCommand;
         if (tempScaffoldingFile != null) {
@@ -184,14 +194,15 @@ public class App {
 
         if (process.exitValue() == 0) {
             System.out.println("✅✅✅ VICTORY! Validation successful! The refactored code compiles correctly. ✅✅✅");
+            // --- CHANGE: Save the validated code to the ORIGINAL filename ---
             Files.writeString(originalFile, refactoredCode);
-            System.out.println("Saved readable and validated test to: " + originalFilePath);
+            System.out.println("Saved readable and validated test to: " + originalFile.getFileName());
         } else {
             System.out.println("❌ Validation FAILED. The LLM-generated code has compilation errors.");
             System.out.println("Compiler Output:\n" + compilerOutput);
             Path failedFile = originalFile.getParent().resolve(originalFile.getFileName().toString().replace(".java", "_refactor_failed.java"));
             Files.writeString(failedFile, refactoredCode);
-            System.out.println("The faulty refactored code has been saved to: " + failedFile);
+            System.out.println("The faulty refactored code has been saved to: " + failedFile.getFileName());
         }
 
         Files.walk(tempDir).sorted(java.util.Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
