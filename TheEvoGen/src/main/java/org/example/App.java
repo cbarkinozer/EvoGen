@@ -25,10 +25,6 @@ public class App {
     private static final String PROJECT_TO_TEST_PATH = "C:\\Repos\\OnlineBankingRestAPI";
     // Configuration
     private static final String EVOSUITE_JAR = "evosuite-master.jar";
-    private static final String SOURCE_DIR = "src/main/java";
-    private static final String PROJECT_CLASSPATH = "target/classes";
-    private static final String CLASS_TO_TEST = "org.example.Calculator";
-    private static final String TEST_OUTPUT_DIR = "evosuite-tests";
 
     // API Configuration - USE AN ENVIRONMENT VARIABLE!
     private static final String GROQ_API_KEY = Dotenv.load().get("GROQ_API_KEY");
