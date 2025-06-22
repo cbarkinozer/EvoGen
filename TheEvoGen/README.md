@@ -29,6 +29,11 @@ Zero manual editing
 High maintainability
 Trustworthy logic from EvoSuite
 
+# 📄 Related Papers
+* Lior Broide, Roni Stern, (18 May 2025), EvoGPT: Enhancing Test Suite Robustness via  LLM-Based Generation and Genetic Optimization: [https://arxiv.org/abs/2505.12424]
+* Matteo Biagiola, Gianluca Ghislotti, Paolo Tonella, (25 Dec 2024), Improving the Readability of Automatically  Generated Tests using Large Language Models: [https://arxiv.org/abs/2412.18843]
+* Zhichao Zhou, Yutian Tang, Yun Lin, Jingzhu He, (19 Aug 2024), An LLM-based Readability Measurement for  Unit Tests’ Context-aware Inputs: [https://arxiv.org/abs/2407.21369]
+
 # 📌 How It Works
 EvoSuite generates the initial raw test file.
 The tool reads the source code and the raw test.
