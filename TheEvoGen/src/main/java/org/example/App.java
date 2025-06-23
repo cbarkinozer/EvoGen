@@ -2,6 +2,7 @@ package org.example;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import io.github.cdimascio.dotenv.Dotenv;
 
 import java.io.File;
 import java.io.IOException;
@@ -12,29 +13,34 @@ import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
-import io.github.cdimascio.dotenv.Dotenv;
+import java.util.stream.Stream;
 
 public class App {
 
     // Configuration
     private static final String EVOSUITE_JAR = "evosuite-master.jar";
     private static final String SOURCE_DIR = "src/main/java";
+    private static final String TEST_SRC_DIR = "src/test/java"; // NEW: Standard test directory
     private static final String PROJECT_CLASSPATH = "target/classes";
     private static final String CLASS_TO_TEST = "org.example.Calculator";
-    private static final String TEST_OUTPUT_DIR = "evosuite-tests";
+    private static final String TEST_OUTPUT_DIR = "evosuite-tests"; // Temporary dir for EvoSuite output
 
-    // API Configuration - USE AN ENVIRONMENT VARIABLE!
+    // NEW: JUnit 5 Dependencies - Place these JARs in your project root or provide correct paths.
+    // Download from Maven Central if you don't have them.
+    private static final String JUNIT_JUPITER_API_JAR = "junit-jupiter-api-5.10.2.jar";
+    private static final String JUNIT_JUPITER_ENGINE_JAR = "junit-jupiter-engine-5.10.2.jar";
+    private static final String OPENTEST4J_JAR = "opentest4j-1.3.0.jar";
+    private static final String JUNIT_PLATFORM_COMMONS_JAR = "junit-platform-commons-1.10.2.jar";
+
+    // API Configuration
     private static final String GROQ_API_KEY = Dotenv.load().get("GROQ_API_KEY");
     private static final String GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
-    private static final String GROQ_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"; // A very capable model
+    private static final String GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
-    // JSON Helper
     private static final Gson GSON = new GsonBuilder().create();
-
-    // Data Classes for JSON
     static class Message { String role; String content; Message(String r, String c) { role=r; content=c; } }
     static class Choice { Message message; }
     static class ChatResponse { List<Choice> choices; }
@@ -42,67 +48,67 @@ public class App {
 
     public static void main(String[] args) throws IOException, InterruptedException {
         if (GROQ_API_KEY == null || GROQ_API_KEY.isBlank()) {
-            System.out.println("❌ FATAL ERROR: GROQ_API_KEY environment variable not set. Please set it and try again.");
+            System.err.println("❌ FATAL ERROR: GROQ_API_KEY environment variable not set.");
             return;
         }
 
-        System.out.println("Starting EvoSuite Refactoring Process (Java version)...");
-        String rawTestPath = runEvoSuite();
+        System.out.println("Starting JUnit 5 Synthesis Process...");
+        String rawEvoSuiteTestPath = runEvoSuite();
 
-        if (rawTestPath != null && !rawTestPath.isBlank()) {
+        if (rawEvoSuiteTestPath != null && !rawEvoSuiteTestPath.isBlank()) {
             System.out.println("\n✅ EvoSuite generation successful.");
-            refactorWithLLM(rawTestPath);
+            synthesizeJUnit5Test(rawEvoSuiteTestPath);
         } else {
-            System.out.println("\n❌ EvoSuite generation failed. Aborting.");
+            System.err.println("\n❌ EvoSuite generation failed. Aborting.");
         }
+
+        // NEW: Clean up the temporary EvoSuite directory
+        cleanupDirectory(Paths.get(TEST_OUTPUT_DIR));
+        System.out.println("\n✨ Process finished.");
     }
 
     private static String runEvoSuite() throws IOException, InterruptedException {
-        System.out.println("--- Step 1: Running EvoSuite to generate raw test ---");
+        System.out.println("--- Step 1: Running EvoSuite to generate inspiration tests ---");
         List<String> command = List.of("java", "-jar", EVOSUITE_JAR, "-class", CLASS_TO_TEST,
                 "-projectCP", PROJECT_CLASSPATH, "-Dtest_dir=" + TEST_OUTPUT_DIR);
 
         ProcessBuilder pb = new ProcessBuilder(command).inheritIO();
         Process process = pb.start();
-        process.waitFor(5, TimeUnit.MINUTES);
+        boolean finished = process.waitFor(5, TimeUnit.MINUTES);
+
+        if (!finished || process.exitValue() != 0) {
+            System.err.println("EvoSuite process did not finish successfully.");
+            return null;
+        }
 
         String expectedFilePath = TEST_OUTPUT_DIR + File.separator + CLASS_TO_TEST.replace('.', File.separatorChar) + "_ESTest.java";
-        if (process.exitValue() == 0 && Files.exists(Paths.get(expectedFilePath))) {
-            return expectedFilePath;
-        }
-        return null;
+        return Files.exists(Paths.get(expectedFilePath)) ? expectedFilePath : null;
     }
 
-    private static void refactorWithLLM(String rawTestFilePath) throws IOException, InterruptedException {
-        // ... This method is fine, no changes needed from your last version. We'll put it here for completeness.
-        System.out.println("\n--- Step 2: Refactoring generated code with Groq LLM ---");
+    // UPDATED: Renamed from refactorWithLLM to reflect new purpose
+    private static void synthesizeJUnit5Test(String rawTestFilePath) throws IOException, InterruptedException {
+        System.out.println("\n--- Step 2: Synthesizing JUnit 5 test with Groq LLM ---");
 
-        String rawCode = Files.readString(Paths.get(rawTestFilePath));
+        String rawEvoSuiteCode = Files.readString(Paths.get(rawTestFilePath));
         String sourceFilePath = SOURCE_DIR + File.separator + CLASS_TO_TEST.replace('.', File.separatorChar) + ".java";
         String sourceCode = Files.readString(Paths.get(sourceFilePath));
 
-        System.out.println("Successfully read raw test file and source context file.");
+        // NEW: Logic to find and read an existing JUnit 5 test
+        String simpleClassName = CLASS_TO_TEST.substring(CLASS_TO_TEST.lastIndexOf('.') + 1);
+        String existingTestFileName = simpleClassName + "Test.java";
+        Path packagePath = Paths.get(TEST_SRC_DIR, CLASS_TO_TEST.substring(0, CLASS_TO_TEST.lastIndexOf('.')).replace('.', File.separatorChar));
+        Path existingTestPath = packagePath.resolve(existingTestFileName);
+        String existingTestCode = null;
 
-        String prompt = "You are an expert senior Java developer assigned to refactor a JUnit test file. The original test was generated by EvoSuite and is difficult to read.\n\n"
-                + "You will be given two pieces of code:\n"
-                + "1. The original Java class under test.\n"
-                + "2. The raw EvoSuite-generated JUnit test for that class.\n\n"
-                + "Your task is to refactor the JUnit test code using the original source as context. Make the test readable, maintainable, and clean for professional developers. Follow these rules STRICTLY:\n"
-                + "1.  **Rename Test Methods:** Change method names like `test01` to a descriptive pattern: `test<MethodName>_<Scenario>_<ExpectedResult>`. E.g., `test01` → `testAdd_WithPositiveNumbers_ShouldReturnCorrectSum`.\n"
-                + "2.  **Rename Variables:** Change cryptic names like `calculator0`, `int0`, etc., to meaningful names like `calculator`, `firstNumber`, `expectedSum`.\n"
-                + "3.  **Add Javadoc Comments:** Add a short Javadoc above each test method describing what is being tested and why.\n"
-                + "4.  **DO NOT CHANGE LOGIC:** Do not modify any assertions (`assertEquals`, `assertThrows`, etc.), method calls, or test behavior. Preserve all logic exactly as-is.\n"
-                + "5.  **PRESERVE EVO SUITE SCAFFOLDING:** Keep EvoSuite-specific methods (e.g., `EvoSuite.setClassLoader()`, `EvoSuite.resetClasses()`, `verifyException`). Do not change or remove them.\n"
-                + "6.  **DO NOT CHANGE THE CLASS NAME.**\n"
-                + "7.  **CODE STYLE:** Use standard Java formatting, consistent indentation, and place `@Test` annotations directly above each method.\n"
-                + "8.  **OUTPUT FORMAT:** Output ONLY the full refactored Java code in a single ```java code block. No explanations, commentary, or markdown outside the code block.\"\n\n"
-                + "---\n"
-                + "**Original Java Class Under Test:**\n"
-                + "```java\n" + sourceCode + "\n```\n"
-                + "---\n"
-                + "**EvoSuite-Generated Test to Refactor:**\n"
-                + "```java\n" + rawCode + "\n```";
+        if (Files.exists(existingTestPath)) {
+            System.out.println("Found existing test file to use as style guide: " + existingTestPath);
+            existingTestCode = Files.readString(existingTestPath);
+        } else {
+            System.out.println("No existing test file found. Will create a new one.");
+        }
 
+        // UPDATED: Use the new dynamic prompt
+        String prompt = createSynthesisPrompt(sourceCode, rawEvoSuiteCode, existingTestCode);
 
         ChatRequest requestPayload = new ChatRequest(List.of(new Message("user", prompt)), GROQ_MODEL);
         String jsonBody = GSON.toJson(requestPayload);
@@ -115,96 +121,116 @@ public class App {
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                 .build();
 
-        System.out.println("Sending request to Groq API for context-aware refactoring...");
+        System.out.println("Sending request to Groq API for test synthesis...");
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() == 200) {
             ChatResponse chatResponse = GSON.fromJson(response.body(), ChatResponse.class);
             String llmMessageContent = chatResponse.choices.get(0).message.content;
 
-            String refactoredCode = null;
-            String lowerCaseContent = llmMessageContent.toLowerCase();
-            int startBlock = lowerCaseContent.indexOf("```java");
-            int endBlock = lowerCaseContent.lastIndexOf("```");
+            // Extract code from markdown block
+            String synthesizedCode = llmMessageContent.substring(llmMessageContent.indexOf("```java") + 7, llmMessageContent.lastIndexOf("```")).trim();
 
-            if (startBlock != -1 && endBlock > startBlock) {
-                refactoredCode = llmMessageContent.substring(startBlock + 7, endBlock).trim();
+            if (!synthesizedCode.isBlank()) {
+                // UPDATED: Pass the target path for the new JUnit 5 test
+                validateAndSaveJUnit5Test(synthesizedCode, existingTestPath);
             } else {
-                refactoredCode = llmMessageContent.trim();
-            }
-
-            if (refactoredCode != null && !refactoredCode.isBlank()) {
-                validateAndSave(refactoredCode, rawTestFilePath);
-            } else {
-                System.out.println("❌ Error: LLM returned an empty or invalid response.");
+                System.err.println("❌ Error: LLM returned an empty or invalid response.");
             }
         } else {
-            System.out.println("❌ API Error: " + response.statusCode() + " | " + response.body());
+            System.err.println("❌ API Error: " + response.statusCode() + " | " + response.body());
         }
     }
 
-    private static void validateAndSave(String refactoredCode, String originalFilePath) throws IOException, InterruptedException {
-        System.out.println("\n--- Step 3: Validating refactored code by compiling ---");
-        Path originalFile = Paths.get(originalFilePath);
-
-        // --- NEW LOGIC TO PRESERVE THE ORIGINAL EVO SUITE FILE ---
-        // 1. Define the new name for the original file.
-        Path preservedOriginalFile = originalFile.getParent().resolve(originalFile.getFileName().toString().replace(".java", ".original.java"));
-
-        // 2. Rename the raw EvoSuite test file (e.g., move Calculator_ESTest.java to Calculator_ESTest.original.java).
-        try {
-            Files.move(originalFile, preservedOriginalFile, StandardCopyOption.REPLACE_EXISTING);
-            System.out.println("Preserved original EvoSuite test as: " + preservedOriginalFile.getFileName());
-        } catch (IOException e) {
-            System.err.println("❌ Could not rename original EvoSuite file: " + e.getMessage());
-            // We can still continue, but the original will be lost if the process succeeds.
-        }
-        // --- END OF NEW LOGIC ---
-
-        Path tempDir = Files.createTempDirectory("refactor-validation");
-        // We will compile the temporary file with the original name.
-        Path tempFile = tempDir.resolve(originalFile.getFileName());
-        Files.writeString(tempFile, refactoredCode);
-
-        Path scaffoldingFile = originalFile.getParent().resolve(originalFile.getFileName().toString().replace(".java", "_scaffolding.java"));
-        Path tempScaffoldingFile = null;
-        if (Files.exists(scaffoldingFile)) {
-            System.out.println("Found scaffolding file: " + scaffoldingFile.getFileName());
-            tempScaffoldingFile = tempDir.resolve(scaffoldingFile.getFileName());
-            Files.copy(scaffoldingFile, tempScaffoldingFile);
-        }
-
-        String currentClasspath = System.getProperty("java.class.path");
-        String evosuiteRuntimeJarPath = new File("evosuite-standalone-runtime-1.2.0.jar").getAbsolutePath();
-        String fullClasspath = currentClasspath + File.pathSeparator + evosuiteRuntimeJarPath;
-
-        System.out.println("Using FINAL classpath for validation: " + fullClasspath);
-
-        List<String> compileCommand;
-        if (tempScaffoldingFile != null) {
-            compileCommand = List.of("javac", "-cp", fullClasspath, tempFile.toString(), tempScaffoldingFile.toString());
+    // NEW: Prompt creation method as defined in section 1
+    private static String createSynthesisPrompt(String sourceCode, String evosuiteCode, String existingTestCode) {
+        // ... (Paste the prompt creation code from Section 1 here) ...
+        StringBuilder promptBuilder = new StringBuilder();
+        promptBuilder.append("You are an expert Java developer specializing in writing clean, modern, and maintainable JUnit 5 tests.\n\n");
+        promptBuilder.append("Your mission is to synthesize a single, comprehensive JUnit 5 test file for a given Java class. You will be provided with up to three pieces of information:\n");
+        promptBuilder.append("1. **The Source Code:** The Java class that needs to be tested.\n");
+        promptBuilder.append("2. **EvoSuite Test (Inspiration):** A test file generated by the EvoSuite tool. This file is NOT to be refactored. Instead, treat it as a 'source of truth' for test cases. Extract the core logic from it (e.g., method calls, inputs, expected outputs, and exceptions) to ensure high test coverage.\n");
+        if (existingTestCode != null) {
+            promptBuilder.append("3. **Existing JUnit 5 Test (Style Guide & Base):** A handwritten test file that already exists. Use this as a guide for style, naming conventions, and structure. Your final output should be a MERGE of the tests in this file and the new tests inspired by the EvoSuite output. Do not remove existing tests.\n\n");
         } else {
-            compileCommand = List.of("javac", "-cp", fullClasspath, tempFile.toString());
+            promptBuilder.append("3. No existing test file was found. You will create a new one from scratch based on the EvoSuite inspiration.\n\n");
         }
+
+        promptBuilder.append("Follow these rules STRICTLY:\n");
+        promptBuilder.append("1.  **OUTPUT JUNIT 5 ONLY:** The final code MUST use JUnit 5. Use imports from `org.junit.jupiter.api.*`. DO NOT include any EvoSuite annotations (`@RunWith`, `@EvoRunnerParameters`) or imports (`org.evosuite.*`). The test must be runnable with a standard JUnit 5 runner.\n");
+        promptBuilder.append("2.  **DESCRIPTIVE NAMING:** Create clear, descriptive test method names, like `testAdd_WithPositiveNumbers_ShouldReturnCorrectSum`. If a style guide is provided, match its naming patterns.\n");
+        promptBuilder.append("3.  **MERGE, DON'T REPLACE:** If an existing test file is provided, add the new test cases inspired by EvoSuite. If a test case seems redundant, prefer the existing handwritten version.\n");
+        promptBuilder.append("4.  **ASSERTIONS:** Use standard JUnit 5 assertions (`Assertions.assertEquals`, `Assertions.assertThrows`, etc.).\n");
+        promptBuilder.append("5.  **NO EVO-SPECIFICS:** Ignore and discard any EvoSuite-specific scaffolding, setup, or verification calls (like `verifyException`). Re-implement exception tests using `assertThrows`.\n");
+        promptBuilder.append("6.  **CLASS NAME:** The test class name should follow the standard convention (e.g., `CalculatorTest.java`), not the EvoSuite convention (`Calculator_ESTest.java`).\n");
+        promptBuilder.append("7.  **IMPORTS:** Be sure only adding necessary, correct and required imports.\n");
+        promptBuilder.append("8.  **OUTPUT FORMAT:** Provide ONLY the complete, final Java code in a single ```java code block. Do not include any explanations or commentary outside the code block.\n\n");
+
+        promptBuilder.append("---\n");
+        promptBuilder.append("**Source Code Under Test:**\n");
+        promptBuilder.append("```java\n").append(sourceCode).append("\n```\n\n");
+
+        promptBuilder.append("---\n");
+        promptBuilder.append("**EvoSuite Test (Inspiration for Test Cases):**\n");
+        promptBuilder.append("```java\n").append(evosuiteCode).append("\n```\n\n");
+
+        if (existingTestCode != null) {
+            promptBuilder.append("---\n");
+            promptBuilder.append("**Existing JUnit 5 Test (Style Guide & Base):**\n");
+            promptBuilder.append("```java\n").append(existingTestCode).append("\n```\n");
+        }
+
+        return promptBuilder.toString();
+    }
+
+    // UPDATED: This method is now completely different. It validates against JUnit 5.
+    private static void validateAndSaveJUnit5Test(String synthesizedCode, Path targetSavePath) throws IOException, InterruptedException {
+        System.out.println("\n--- Step 3: Validating synthesized JUnit 5 code by compiling ---");
+        Path tempDir = Files.createTempDirectory("junit5-validation");
+        Path tempFile = tempDir.resolve(targetSavePath.getFileName());
+        Files.writeString(tempFile, synthesizedCode);
+
+        // NEW: Build the classpath for JUnit 5 compilation
+        String classpath = String.join(File.pathSeparator,
+                PROJECT_CLASSPATH,
+                new File(JUNIT_JUPITER_API_JAR).getAbsolutePath(),
+                new File(JUNIT_JUPITER_ENGINE_JAR).getAbsolutePath(),
+                new File(OPENTEST4J_JAR).getAbsolutePath(),
+                new File(JUNIT_PLATFORM_COMMONS_JAR).getAbsolutePath()
+        );
+
+        System.out.println("Using JUnit 5 classpath for validation: " + classpath);
+        List<String> compileCommand = List.of("javac", "-cp", classpath, tempFile.toString());
 
         ProcessBuilder pb = new ProcessBuilder(compileCommand).redirectErrorStream(true);
         Process process = pb.start();
         String compilerOutput = new String(process.getInputStream().readAllBytes());
-        process.waitFor(30, TimeUnit.SECONDS);
+        boolean finished = process.waitFor(30, TimeUnit.SECONDS);
 
-        if (process.exitValue() == 0) {
-            System.out.println("✅✅✅ VICTORY! Validation successful! The refactored code compiles correctly. ✅✅✅");
-            // --- CHANGE: Save the validated code to the ORIGINAL filename ---
-            Files.writeString(originalFile, refactoredCode);
-            System.out.println("Saved readable and validated test to: " + originalFile.getFileName());
+        if (finished && process.exitValue() == 0) {
+            System.out.println("✅✅✅ VICTORY! Validation successful! The synthesized code compiles correctly. ✅✅✅");
+            // Ensure the target directory exists
+            Files.createDirectories(targetSavePath.getParent());
+            Files.writeString(targetSavePath, synthesizedCode);
+            System.out.println("Saved new/updated JUnit 5 test to: " + targetSavePath);
         } else {
-            System.out.println("❌ Validation FAILED. The LLM-generated code has compilation errors.");
-            System.out.println("Compiler Output:\n" + compilerOutput);
-            Path failedFile = originalFile.getParent().resolve(originalFile.getFileName().toString().replace(".java", "_refactor_failed.java"));
-            Files.writeString(failedFile, refactoredCode);
-            System.out.println("The faulty refactored code has been saved to: " + failedFile.getFileName());
+            System.err.println("❌ Validation FAILED. The LLM-generated code has compilation errors.");
+            System.err.println("Compiler Output:\n" + compilerOutput);
+            Path failedFile = targetSavePath.getParent().resolve(targetSavePath.getFileName().toString().replace(".java", "_synthesis_failed.java"));
+            Files.writeString(failedFile, synthesizedCode);
+            System.out.println("The faulty synthesized code has been saved to: " + failedFile);
         }
+        cleanupDirectory(tempDir);
+    }
 
-        Files.walk(tempDir).sorted(java.util.Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+    // NEW: Utility to clean up directories
+    private static void cleanupDirectory(Path dir) throws IOException {
+        if (!Files.exists(dir)) return;
+        try (Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(Comparator.reverseOrder())
+                    .map(Path::toFile)
+                    .forEach(File::delete);
+            System.out.println("Cleaned up directory: " + dir);
+        }
     }
 }
