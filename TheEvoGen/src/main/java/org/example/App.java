@@ -108,6 +108,20 @@ public class App {
 
         ExecutorService executor = Executors.newFixedThreadPool(PARALLEL_THREADS);
 
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("\n🚨 Shutdown signal received. Forcibly terminating executor and child processes...");
+            executor.shutdownNow(); // Attempt to stop all actively executing tasks
+            try {
+                // Wait a bit for tasks to respond to cancellation
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    System.err.println("Executor did not terminate in the specified time.");
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow(); // Re-cancel if current thread is interrupted
+            }
+            System.out.println("✅ Shutdown hook finished.");
+        }));
+
         for (String className : classesToTest) {
             executor.submit(() -> {
                 try {
@@ -166,28 +180,39 @@ public class App {
     private static String processClass(String className, String projectPath) {
         System.out.printf("▶️  Processing class: %s\n", className);
         Path projectRoot = Paths.get(projectPath);
-        Path testOutputDir = projectRoot.resolve("evosuite-tests-" + className.replace('.', '_')); // Unique temp dir
+        // Unique temp dir for EvoSuite artifacts if they are created
+        Path testOutputDir = projectRoot.resolve("evosuite-tests-" + className.replace('.', '_'));
 
         try {
-            // Step 1: Run EvoSuite
+            // Step 1: Attempt to run EvoSuite
             String rawEvoSuiteTestPath = runEvoSuite(className, projectRoot, testOutputDir);
-            if (rawEvoSuiteTestPath == null) {
-                return "EvoSuite Failure: Could not generate an initial test file.";
-            }
-            System.out.printf("[%s] -> EvoSuite generation successful.\n", className);
+            String rawEvoSuiteCode = null;
 
-            // Step 2 & 3: Synthesize with LLM and Validate
-            String synthesisResult = synthesizeAndValidate(className, projectRoot, rawEvoSuiteTestPath, testOutputDir);
+            if (rawEvoSuiteTestPath != null) {
+                System.out.printf("[%s] -> EvoSuite generation successful.\n", className);
+                rawEvoSuiteCode = Files.readString(Paths.get(rawEvoSuiteTestPath));
+            } else {
+                // THIS IS THE KEY CHANGE: Don't fail. Just warn and continue.
+                System.out.printf("[%s] -> ⚠️ WARNING: EvoSuite failed to generate tests. Proceeding with LLM synthesis using only source code.\n", className);
+            }
+
+            // Step 2 & 3: Synthesize with LLM and Validate (this step now runs regardless of EvoSuite's success)
+            String synthesisResult = synthesizeAndValidate(className, projectRoot, rawEvoSuiteCode);
 
             if (synthesisResult == null) {
                 System.out.printf("✅ [%s] Successfully synthesized and validated test!\n", className);
                 return null; // Success
             } else {
-                return synthesisResult; // Failure reason from synthesis/validation
+                // Prepend the EvoSuite failure warning to the final failure reason if it happened.
+                String finalFailureReason = (rawEvoSuiteCode == null ? "[EvoSuite Failed] " : "") + synthesisResult;
+                return finalFailureReason;
             }
 
         } catch (Exception e) {
-            return "Unhandled Exception: " + e.getMessage();
+            String errorMsg = "Unhandled Exception: " + e.getClass().getSimpleName() + " - " + e.getMessage();
+            System.err.printf("[%s] 🔥 Uncaught exception: %s\n", className, e.getMessage());
+            e.printStackTrace();
+            return errorMsg;
         } finally {
             try {
                 cleanupDirectory(testOutputDir);
@@ -197,77 +222,74 @@ public class App {
         }
     }
 
-    private static String runEvoSuite(String className, Path projectRoot, Path testOutputDir) throws IOException, InterruptedException {
-        System.out.printf("[%s] -> Generating full project classpath with Maven...\n", className);
+    private static String runEvoSuite(String className, Path projectRoot, Path testOutputDir) throws IOException {
+        Process mvnProcess = null;
+        Process evosuiteProcess = null;
+        try {
+            System.out.printf("[%s] -> Generating full project classpath with Maven...\n", className);
+            String classpathFile = testOutputDir.resolve("classpath.txt").toString();
+            String mvnCommand = String.format("mvn dependency:build-classpath -Dmdep.outputFile=%s -q", classpathFile); // Added -q for quieter output
 
-        // STEP 1: Use Maven to get the full dependency classpath.
-        // This command tells Maven to build a classpath string and save it to a file.
-        String classpathFile = testOutputDir.resolve("classpath.txt").toString();
-        String mvnCommand = String.format("mvn dependency:build-classpath -Dmdep.outputFile=%s", classpathFile);
+            ProcessBuilder mvnPb;
+            if (System.getProperty("os.name").toLowerCase().contains("win")) {
+                mvnPb = new ProcessBuilder("cmd.exe", "/c", mvnCommand);
+            } else {
+                mvnPb = new ProcessBuilder("bash", "-c", mvnCommand);
+            }
+            mvnPb.directory(projectRoot.toFile());
+            mvnProcess = mvnPb.start();
 
-        // On Windows, mvn is a .cmd file, so we need to run it through cmd.exe
-        ProcessBuilder mvnPb;
-        if (System.getProperty("os.name").toLowerCase().contains("win")) {
-            mvnPb = new ProcessBuilder("cmd.exe", "/c", mvnCommand);
-        } else {
-            mvnPb = new ProcessBuilder("bash", "-c", mvnCommand);
-        }
+            // Wait for Maven, but handle interruption
+            if (!mvnProcess.waitFor(2, TimeUnit.MINUTES)) {
+                mvnProcess.destroyForcibly();
+                System.err.printf("[%s] -> Maven process timed out.\n", className);
+                return null;
+            }
 
-        mvnPb.directory(projectRoot.toFile()); // Run the command in the target project's directory
-        mvnPb.redirectErrorStream(true);       // We can capture output for debugging if needed
+            if (mvnProcess.exitValue() != 0) {
+                // Capture error output if maven fails
+                String mvnErrorOutput = new String(mvnProcess.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+                System.err.printf("[%s] -> Maven dependency build failed. Error:\n%s\n", className, mvnErrorOutput);
+                return null;
+            }
 
-        Process mvnProcess = mvnPb.start();
-        // It's good practice to capture the output in case of Maven errors
-        String mvnOutput = new String(mvnProcess.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            String dependencyClasspath = Files.readString(Paths.get(classpathFile));
+            String projectCP = projectRoot.resolve("target/classes").toString();
+            String fullClasspath = projectCP + File.pathSeparator + dependencyClasspath;
 
-        int mvnExitCode = mvnProcess.waitFor();
+            System.out.printf("[%s] -> Classpath generated. Starting EvoSuite process...\n", className);
+            List<String> command = List.of("java", "-jar", EVOSUITE_JAR, "-class", className, "-projectCP", fullClasspath, "-Dtest_dir=" + testOutputDir.toString());
 
-        if (mvnExitCode != 0) {
-            System.err.printf("[%s] -> Maven dependency build failed with exit code %d.\n", className, mvnExitCode);
-            System.err.println("--- Maven Output ---");
-            System.err.println(mvnOutput);
-            System.err.println("--- End Maven Output ---");
-            return null; // Can't proceed without a classpath
-        }
+            ProcessBuilder evosuitePb = new ProcessBuilder(command);
+            evosuitePb.inheritIO();
+            evosuiteProcess = evosuitePb.start();
 
-        String dependencyClasspath = Files.readString(Paths.get(classpathFile));
-        String projectCP = projectRoot.resolve("target/classes").toString();
-        String fullClasspath = projectCP + File.pathSeparator + dependencyClasspath;
+            // Wait for EvoSuite, but handle interruption
+            if (!evosuiteProcess.waitFor(5, TimeUnit.MINUTES)) {
+                evosuiteProcess.destroyForcibly();
+                System.err.printf("[%s] -> EvoSuite process timed out.\n", className);
+                return null;
+            }
 
-        System.out.printf("[%s] -> Classpath generated. Starting EvoSuite process...\n", className);
+            System.out.printf("[%s] -> EvoSuite process finished with exit code: %d\n", className, evosuiteProcess.exitValue());
+            if (evosuiteProcess.exitValue() != 0) return null;
 
-        // STEP 2: Run EvoSuite with the FULL classpath.
-        List<String> command = List.of("java", "-jar", EVOSUITE_JAR, "-class", className,
-                "-projectCP", fullClasspath, // Use the full classpath here!
-                "-Dtest_dir=" + testOutputDir.toString());
+            String expectedFilePath = testOutputDir.resolve(className.replace('.', File.separatorChar) + "_ESTest.java").toString();
+            return Files.exists(Paths.get(expectedFilePath)) ? expectedFilePath : null;
 
-        ProcessBuilder evosuitePb = new ProcessBuilder(command);
-        evosuitePb.inheritIO(); // Keep this for visibility!
-
-        Process process = evosuitePb.start();
-        boolean finished = process.waitFor(5, TimeUnit.MINUTES);
-
-        if (!finished) {
-            process.destroyForcibly();
-            System.err.printf("[%s] -> EvoSuite process timed out after 5 minutes and was killed.\n", className);
+        } catch (InterruptedException e) {
+            // This block now executes when you press the stop button!
+            System.err.printf("[%s] -> Interrupted while waiting for external process. Terminating...\n", className);
+            if (mvnProcess != null) mvnProcess.destroyForcibly();
+            if (evosuiteProcess != null) evosuiteProcess.destroyForcibly();
+            // Preserve the interrupted status
+            Thread.currentThread().interrupt();
             return null;
         }
-
-        System.out.printf("[%s] -> EvoSuite process finished with exit code: %d\n", className, process.exitValue());
-
-        if (process.exitValue() != 0) {
-            return null;
-        }
-
-        String expectedFilePath = testOutputDir.resolve(className.replace('.', File.separatorChar) + "_ESTest.java").toString();
-        return Files.exists(Paths.get(expectedFilePath)) ? expectedFilePath : null;
     }
 
-    private static String synthesizeAndValidate(String className, Path projectRoot, String rawTestFilePath, Path tempEvoSuiteDir) throws IOException, InterruptedException {
+    private static String synthesizeAndValidate(String className, Path projectRoot, String rawEvoSuiteCode) throws IOException, InterruptedException {
         System.out.printf("[%s] -> Synthesizing JUnit 5 test with LLM...\n", className);
-
-        // --- Prepare inputs for the LLM ---
-        String rawEvoSuiteCode = Files.readString(Paths.get(rawTestFilePath));
 
         Path sourceFilePath = projectRoot.resolve("src/main/java").resolve(className.replace('.', File.separatorChar) + ".java");
         if (!Files.exists(sourceFilePath)) {
@@ -324,26 +346,38 @@ public class App {
     private static String createSynthesisPrompt(String sourceCode, String evosuiteCode, String existingTestCode) {
         StringBuilder promptBuilder = new StringBuilder();
         promptBuilder.append("You are an expert Java developer specializing in writing clean, modern, and maintainable JUnit 5 tests.\n\n");
-        promptBuilder.append("Your mission is to synthesize a single, comprehensive JUnit 5 test file for a given Java class. You will be provided with up to three pieces of information:\n");
+        promptBuilder.append("Your mission is to synthesize a single, comprehensive JUnit 5 test file for a given Java class. You will be provided with the following information:\n");
         promptBuilder.append("1. **The Source Code:** The Java class that needs to be tested.\n");
-        promptBuilder.append("2. **EvoSuite Test (Inspiration):** A test file generated by the EvoSuite tool. This file is NOT to be refactored. Instead, treat it as a 'source of truth' for test cases. Extract the core logic from it (e.g., method calls, inputs, expected outputs, and exceptions) to ensure high test coverage.\n");
+
+        // DYNAMICALLY CHANGE THE PROMPT BASED ON AVAILABLE INFORMATION
+        if (evosuiteCode != null) {
+            promptBuilder.append("2. **EvoSuite Test (Inspiration):** A test file generated by the EvoSuite tool. Treat this as a 'source of truth' for test cases. Extract the core logic (method calls, inputs, assertions) to ensure high test coverage.\n");
+        }
+
         if (existingTestCode != null) {
-            promptBuilder.append("3. **Existing JUnit 5 Test (Style Guide & Base):** A handwritten test file that already exists. Use this as a guide for style, naming conventions, and structure. Your final output should be a MERGE of the tests in this file and the new tests inspired by the EvoSuite output. Do not remove existing tests.\n\n");
+            promptBuilder.append("3. **Existing JUnit 5 Test (Style Guide & Base):** A handwritten test file. Use this as a guide for style and structure. Your final output should MERGE the tests from this file with new tests. Do not remove existing tests.\n\n");
         } else {
-            promptBuilder.append("3. No existing test file was found. You will create a new one from scratch based on the EvoSuite inspiration.\n\n");
+            promptBuilder.append("3. No existing test file was found. You will create a new one from scratch.\n\n");
+        }
+
+        if (evosuiteCode == null) {
+            promptBuilder.append("**IMPORTANT:** No EvoSuite test was provided. You must generate high-quality test cases based *only* on your analysis of the source code. Cover common scenarios, edge cases, and potential null inputs.\n\n");
         }
 
         promptBuilder.append("Follow these rules STRICTLY:\n");
-        promptBuilder.append("1.  **OUTPUT JUNIT 5 ONLY:** The final code MUST use JUnit 5. Use imports from `org.junit.jupiter.api.*`. If you need parameterized tests, use `org.junit.jupiter.params.*`. DO NOT include any EvoSuite annotations or imports.\n");
-        promptBuilder.append("2.  **DESCRIPTIVE NAMING:** Create clear, descriptive test method names, like `testAdd_WithPositiveNumbers_ShouldReturnCorrectSum`. If a style guide is provided, match its naming patterns.\n");
-        promptBuilder.append("3.  **MERGE, DON'T REPLACE:** If an existing test file is provided, add the new test cases inspired by EvoSuite. If a test case seems redundant, prefer the existing handwritten version.\n");
+        promptBuilder.append("1.  **OUTPUT JUNIT 5 ONLY:** The final code MUST use JUnit 5 (`org.junit.jupiter.api.*`).\n");
+        promptBuilder.append("2.  **DESCRIPTIVE NAMING:** Create clear test method names (e.g., `testAdd_WithPositiveNumbers_ShouldReturnCorrectSum`).\n");
+        promptBuilder.append("3.  **MERGE, DON'T REPLACE:** If an existing test file is provided, add new test cases to it.\n");
         promptBuilder.append("4.  **ASSERTIONS:** Use standard JUnit 5 assertions (`Assertions.assertEquals`, `Assertions.assertThrows`, etc.).\n");
-        promptBuilder.append("5.  **NO EVO-SPECIFICS:** Ignore and discard any EvoSuite-specific scaffolding, setup, or verification calls. Re-implement exception tests using `assertThrows`.\n");
-        promptBuilder.append("6.  **CLASS NAME:** The test class name should follow the standard convention (e.g., `CalculatorTest.java`).\n");
-        promptBuilder.append("7.  **OUTPUT FORMAT:** Provide ONLY the complete, final Java code in a single ```java code block. Do not include any explanations or commentary outside the code block.\n\n");
+        promptBuilder.append("5.  **NO EVO-SPECIFICS:** Discard any EvoSuite-specific code if it was provided.\n");
+        promptBuilder.append("6.  **OUTPUT FORMAT:** Provide ONLY the complete Java code in a single ```java code block.\n\n");
 
         promptBuilder.append("---\n**Source Code Under Test:**\n```java\n").append(sourceCode).append("\n```\n\n");
-        promptBuilder.append("---\n**EvoSuite Test (Inspiration for Test Cases):**\n```java\n").append(evosuiteCode).append("\n```\n\n");
+
+        if (evosuiteCode != null) {
+            promptBuilder.append("---\n**EvoSuite Test (Inspiration for Test Cases):**\n```java\n").append(evosuiteCode).append("\n```\n\n");
+        }
+
         if (existingTestCode != null) {
             promptBuilder.append("---\n**Existing JUnit 5 Test (Style Guide & Base):**\n```java\n").append(existingTestCode).append("\n```\n");
         }
@@ -407,10 +441,6 @@ public class App {
             String missingPackage = parseMissingPackage(compilerOutput);
             if (missingPackage == null || resolvedPackages.contains(missingPackage)) {
                 String failureReason = "Compilation Failure: " + (missingPackage == null ? "Syntax error or other non-dependency issue." : "Could not resolve '" + missingPackage + "' after repeated attempts.") + "\n--- Compiler Output ---\n" + compilerOutput;
-                Path failedFile = targetSavePath.getParent().resolve(targetSavePath.getFileName().toString().replace(".java", "_synthesis_failed.java"));
-                Files.createDirectories(failedFile.getParent());
-                Files.writeString(failedFile, synthesizedCode);
-                System.err.printf("[%s] -> Wrote failed synthesis to: %s\n", className, failedFile);
                 cleanupDirectory(tempDir);
                 return failureReason;
             }
