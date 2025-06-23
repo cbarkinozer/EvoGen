@@ -40,7 +40,7 @@ import java.util.stream.Stream;
  *    it automatically searches Maven Central for the required JAR, downloads it, and
  *    retries compilation.
  */
-public class App {
+public class SingleFile {
 
     // --- Configuration ---
     private static final String EVOSUITE_JAR = "evosuite-master.jar";
