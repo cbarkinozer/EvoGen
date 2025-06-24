@@ -228,7 +228,10 @@ public class ProjectLevel {
         try {
             System.out.printf("[%s] -> Generating full project classpath with Maven...\n", className);
             String classpathFile = testOutputDir.resolve("classpath.txt").toString();
-            String mvnCommand = String.format("mvn dependency:build-classpath -Dmdep.outputFile=%s -q", classpathFile); // Added -q for quieter output
+            String mvnCommand = String.format(
+                    "mvn dependency:build-classpath -Dmdep.outputFile=%s -DincludeScope=runtime -q",
+                    classpathFile
+            );
 
             ProcessBuilder mvnPb;
             if (System.getProperty("os.name").toLowerCase().contains("win")) {
@@ -258,7 +261,14 @@ public class ProjectLevel {
             String fullClasspath = projectCP + File.pathSeparator + dependencyClasspath;
 
             System.out.printf("[%s] -> Classpath generated. Starting EvoSuite process...\n", className);
-            List<String> command = List.of("java", "-jar", EVOSUITE_JAR, "-class", className, "-projectCP", fullClasspath, "-Dtest_dir=" + testOutputDir.toString());
+            List<String> command = List.of(
+                    "java", "-jar", EVOSUITE_JAR,
+                    "-class", className,
+                    "-projectCP", fullClasspath,
+                    "-Dtest_dir=" + testOutputDir.toString(),
+                    "-Dmock_if_no_generator=true", // <-- Very important for Spring
+                    "-Dsearch_budget=60" // Give it 60 seconds to run
+            );
 
             ProcessBuilder evosuitePb = new ProcessBuilder(command);
             evosuitePb.inheritIO();
