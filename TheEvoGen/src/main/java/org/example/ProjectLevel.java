@@ -31,6 +31,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+
 /**
  * An agentic tool to autonomously generate and maintain high-quality JUnit 5 tests for a full Java project.
  *
@@ -47,7 +48,7 @@ import java.util.stream.Stream;
 public class ProjectLevel {
 
     // --- High-Level Project Configuration ---
-    private static final String PROJECT_TO_TEST_PATH = "C:\\Repos\\OnlineBankingRestAPI"; // <--- IMPORTANT: SET THIS
+    private static final String PROJECT_TO_TEST_PATH = "C:\\Repos\\bitirmeprojesi-cbarkinozer"; // <--- IMPORTANT: SET THIS
     private static final int PARALLEL_THREADS = 4; // Number of classes to process in parallel
 
     // --- EvoSuite Configuration ---
@@ -65,9 +66,13 @@ public class ProjectLevel {
     );
 
     // --- API Configuration ---
+    private enum ApiProvider { GROQ, GEMINI }
+    private static final ApiProvider API_PROVIDER = ApiProvider.GROQ; // Gemini pass the quota and fail
     private static final String GROQ_API_KEY = Dotenv.load().get("GROQ_API_KEY");
     private static final String GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
     private static final String GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
+    private static final String GEMINI_API_KEY = Dotenv.load().get("GEMINI_API_KEY");
+    private static final String GEMINI_MODEL = "gemini-2.5-pro";
 
     // Rate Limiting: 30 RPM for the model. 60,000ms / 30 = 2,000ms per request. Add a buffer.
     private static final long API_REQUEST_DELAY_MS = 2100;
@@ -75,13 +80,22 @@ public class ProjectLevel {
     // --- Helpers and Data Classes ---
     private static final Gson GSON = new GsonBuilder().create();
     private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
+    // OpenAI/Groq-style classes
     static class Message { String role; String content; Message(String r, String c) { role=r; content=c; } }
     static class Choice { Message message; }
     static class ChatResponse { List<Choice> choices; }
     static class ChatRequest { List<Message> messages; String model; ChatRequest(List<Message> m, String mo) { messages=m; model=mo; } }
+    // Gemini-style classes
+    static class GeminiPart { String text; GeminiPart(String t) { this.text = t; } }
+    static class GeminiContent { List<GeminiPart> parts; GeminiContent(List<GeminiPart> p) { this.parts = p; } }
+    static class GeminiCandidate { GeminiContent content; }
+    static class GeminiResponse { List<GeminiCandidate> candidates; }
+    static class GeminiRequest { List<GeminiContent> contents; GeminiRequest(List<GeminiContent> c) { this.contents = c; } }
+    // Maven search classes
     static class MavenDoc { String g; String a; String v; }
     static class MavenResponse { List<MavenDoc> docs; }
     static class MavenSearchResponse { MavenResponse response; }
+
 
     // --- Thread-Safe Logging for Summary ---
     private static final List<String> successLog = Collections.synchronizedList(new ArrayList<>());
@@ -90,10 +104,16 @@ public class ProjectLevel {
     public static void main(String[] args) throws IOException, InterruptedException {
         long startTime = System.nanoTime();
 
-        if (GROQ_API_KEY == null || GROQ_API_KEY.isBlank()) {
-            System.err.println("❌ FATAL ERROR: GROQ_API_KEY environment variable not set.");
+        // Check for required API keys based on the selected provider
+        if (API_PROVIDER == ApiProvider.GROQ && (GROQ_API_KEY == null || GROQ_API_KEY.isBlank())) {
+            System.err.println("❌ FATAL ERROR: GROQ_API_KEY environment variable not set for Groq provider.");
             return;
         }
+        if (API_PROVIDER == ApiProvider.GEMINI && (GEMINI_API_KEY == null || GEMINI_API_KEY.isBlank())) {
+            System.err.println("❌ FATAL ERROR: GEMINI_API_KEY environment variable not set for Gemini provider.");
+            return;
+        }
+
         Files.createDirectories(DEPENDENCY_CACHE_DIR);
 
         System.out.println("🚀 Starting Test Generation Bot for project: " + PROJECT_TO_TEST_PATH);
@@ -104,7 +124,8 @@ public class ProjectLevel {
             return;
         }
 
-        System.out.println("✅ Found " + classesToTest.size() + " classes. Starting parallel processing with " + PARALLEL_THREADS + " threads...");
+        System.out.println("✅ Found " + classesToTest.size() + " classes. Starting parallel processing with " + PARALLEL_THREADS + " threads using " + API_PROVIDER + "...");
+
 
         ExecutorService executor = Executors.newFixedThreadPool(PARALLEL_THREADS);
 
@@ -299,7 +320,7 @@ public class ProjectLevel {
     }
 
     private static String synthesizeAndValidate(String className, Path projectRoot, String rawEvoSuiteCode) throws IOException, InterruptedException {
-        System.out.printf("[%s] -> Synthesizing JUnit 5 test with LLM...\n", className);
+        System.out.printf("[%s] -> Synthesizing JUnit 5 test with LLM (%s)...%n", className, API_PROVIDER);
 
         Path sourceFilePath = projectRoot.resolve("src/main/java").resolve(className.replace('.', File.separatorChar) + ".java");
         if (!Files.exists(sourceFilePath)) {
@@ -315,34 +336,21 @@ public class ProjectLevel {
 
         String existingTestCode = null;
         if (Files.exists(existingTestPath)) {
-            System.out.printf("[%s] -> Found existing test file to use as style guide: %s\n", className, existingTestPath);
+            System.out.printf("[%s] -> Found existing test file to use as style guide: %s%n", className, existingTestPath);
             existingTestCode = Files.readString(existingTestPath);
         }
 
         String prompt = createSynthesisPrompt(sourceCode, rawEvoSuiteCode, existingTestCode);
 
-        // --- Respect API Rate Limits ---
-        Thread.sleep(API_REQUEST_DELAY_MS);
+        // Call the new centralized API method
+        String llmMessageContent = callLlmApi(prompt);
 
-        // --- Call LLM API ---
-        ChatRequest requestPayload = new ChatRequest(List.of(new Message("user", prompt)), GROQ_MODEL);
-        HttpRequest request = HttpRequest.newBuilder().uri(URI.create(GROQ_API_URL))
-                .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + GROQ_API_KEY)
-                .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(requestPayload))).build();
-
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() != 200) {
-            return "LLM API Error: " + response.statusCode() + " | " + response.body();
+        // Check for errors from the API call
+        if (llmMessageContent.startsWith("LLM API Error") || llmMessageContent.startsWith("LLM Synthesis Failure")) {
+            return llmMessageContent;
         }
 
         // --- Parse LLM Response ---
-        ChatResponse chatResponse = GSON.fromJson(response.body(), ChatResponse.class);
-        if (chatResponse.choices == null || chatResponse.choices.isEmpty()) {
-            return "LLM Synthesis Failure: API response was empty or malformed.";
-        }
-        String llmMessageContent = chatResponse.choices.get(0).message.content;
         String synthesizedCode = parseCodeFromLLMResponse(llmMessageContent);
 
         if (synthesizedCode.isBlank()) {
@@ -352,6 +360,65 @@ public class ProjectLevel {
         // --- Validate and Save ---
         return validateAndSaveJUnit5Test(synthesizedCode, existingTestPath, projectRoot);
     }
+
+    private static String callLlmApi(String prompt) throws IOException, InterruptedException {
+        // Respect rate limits
+        Thread.sleep(API_REQUEST_DELAY_MS);
+
+        if (API_PROVIDER == ApiProvider.GROQ) {
+            System.out.println("      -> Calling Groq API...");
+            ChatRequest requestPayload = new ChatRequest(List.of(new Message("user", prompt)), GROQ_MODEL);
+            HttpRequest request = HttpRequest.newBuilder().uri(URI.create(GROQ_API_URL))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + GROQ_API_KEY)
+                    .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(requestPayload))).build();
+
+            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                return "LLM API Error (Groq): " + response.statusCode() + " | " + response.body();
+            }
+
+            ChatResponse chatResponse = GSON.fromJson(response.body(), ChatResponse.class);
+            if (chatResponse.choices == null || chatResponse.choices.isEmpty() || chatResponse.choices.get(0).message == null) {
+                return "LLM Synthesis Failure (Groq): API response was empty or malformed.";
+            }
+            return chatResponse.choices.get(0).message.content;
+
+        } else if (API_PROVIDER == ApiProvider.GEMINI) {
+            System.out.println("      -> Calling Gemini API...");
+            String geminiUrl = String.format("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", GEMINI_MODEL, GEMINI_API_KEY);
+
+            // Construct the Gemini-specific payload
+            GeminiRequest requestPayload = new GeminiRequest(
+                    List.of(new GeminiContent(List.of(new GeminiPart(prompt))))
+            );
+
+            HttpRequest request = HttpRequest.newBuilder().uri(URI.create(geminiUrl))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(requestPayload))).build();
+
+            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                return "LLM API Error (Gemini): " + response.statusCode() + " | " + response.body();
+            }
+
+            GeminiResponse geminiResponse = GSON.fromJson(response.body(), GeminiResponse.class);
+            if (geminiResponse.candidates == null || geminiResponse.candidates.isEmpty()
+                    || geminiResponse.candidates.get(0).content == null
+                    || geminiResponse.candidates.get(0).content.parts == null
+                    || geminiResponse.candidates.get(0).content.parts.isEmpty()
+                    || geminiResponse.candidates.get(0).content.parts.get(0).text == null) {
+                return "LLM Synthesis Failure (Gemini): API response was empty or malformed. Body: " + response.body();
+            }
+            return geminiResponse.candidates.get(0).content.parts.get(0).text;
+
+        } else {
+            return "LLM Synthesis Failure: Unknown API provider configured.";
+        }
+    }
+
 
     private static String createSynthesisPrompt(String sourceCode, String evosuiteCode, String existingTestCode) {
         StringBuilder promptBuilder = new StringBuilder();
